@@ -17,8 +17,8 @@ export async function runTerminal(
   terminal.on("SIGINT", interrupt);
 
   output.write(
-    "OhHarness — paragraph summarizer\n" +
-      "Paste a paragraph; submit with a blank line. /exit quits.\n" +
+    "OhHarness — summary and word-count assistant\n" +
+      "Paste text or a word-count task; submit with a blank line. /exit quits.\n" +
       "Each submission is independent and is sent to OpenAI.\n\nParagraph:\n",
   );
 
@@ -50,15 +50,15 @@ export async function runTerminal(
       }
       if (!paragraph) continue;
 
-      output.write("Summarizing…\n");
+      output.write("Working…\n");
       try {
-        const summary = await summarize(paragraph, controller.signal);
+        const answer = await summarize(paragraph, controller.signal);
         if (controller.signal.aborted) break;
-        output.write(`\nSummary:\n${summary}\n`);
+        output.write(`\nAnswer:\n${answer}\n`);
       } catch (error) {
         if (controller.signal.aborted) break;
         output.write(
-          `Error: ${error instanceof Error ? error.message : "Summarization failed."}\n`,
+          `Error: ${error instanceof Error ? error.message : "The task failed."}\n`,
         );
       }
       paragraph = "";

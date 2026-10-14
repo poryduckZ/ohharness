@@ -19,6 +19,21 @@ function modelResponse(status: string, text: string) {
   };
 }
 
+function toolCall(callId: string, args: string, name = "count_words") {
+  return {
+    type: "function_call",
+    id: `fc_${callId}`,
+    call_id: callId,
+    name,
+    arguments: args,
+    status: "completed",
+  };
+}
+
+function toolResponse(calls: ReturnType<typeof toolCall>[]) {
+  return { ...modelResponse("completed", ""), output: calls };
+}
+
 async function startHarness(
   context: TestContext,
   replies: { status: number; body: unknown }[],
@@ -109,20 +124,26 @@ test("compiled CLI summarizes two paragraphs independently and stays open betwee
     "\nThe library now closes at 9 pm.\nWeekend hours are unchanged.\n\n",
   );
   await harness.waitFor(
-    "Summary:\nLibrary hours expanded on weekdays only.\n\nParagraph:\n",
+    "Answer:\nLibrary hours expanded on weekdays only.\n\nParagraph:\n",
   );
   expect(harness.child.exitCode).toBeNull();
   harness.child.stdin.write("Fog canceled today's ferry service.\n\n");
   await harness.waitFor(
-    "Summary:\nFog canceled the ferry service.\n\nParagraph:\n",
+    "Answer:\nFog canceled the ferry service.\n\nParagraph:\n",
   );
   expect(harness.child.exitCode).toBeNull();
   harness.child.stdin.write("/exit\n");
   expect(await harness.finished).toEqual([0, null]);
   expect(harness.transcript()).toContain("Goodbye.");
   expect(harness.requests.map(({ body }) => body.input)).toEqual([
-    "The library now closes at 9 pm.\nWeekend hours are unchanged.",
-    "Fog canceled today's ferry service.",
+    [
+      {
+        role: "user",
+        content:
+          "The library now closes at 9 pm.\nWeekend hours are unchanged.",
+      },
+    ],
+    [{ role: "user", content: "Fog canceled today's ferry service." }],
   ]);
   for (const request of harness.requests) {
     expect(request).toMatchObject({
@@ -139,6 +160,170 @@ test("compiled CLI summarizes two paragraphs independently and stays open betwee
   }
 });
 
+test("CLI runs tools across three model calls, matches results to calls, and resets history", async (context) => {
+  const firstCalls = [
+    toolCall("first", JSON.stringify({ text: "  The\tferry\nis late.  " })),
+    toolCall("empty", JSON.stringify({ text: " \t\n " })),
+  ];
+  const lastCall = toolCall("last", JSON.stringify({ text: "你好 café" }));
+  const firstResponse = modelResponse(
+    "completed",
+    "Counting the supplied text.",
+  );
+  const harness = await startHarness(context, [
+    {
+      status: 200,
+      body: {
+        ...firstResponse,
+        output: [...firstResponse.output, ...firstCalls],
+      },
+    },
+    { status: 200, body: toolResponse([lastCall]) },
+    {
+      status: 200,
+      body: modelResponse("completed", "The counts are 4, 0, and 2."),
+    },
+    { status: 200, body: modelResponse("completed", "A separate summary.") },
+  ]);
+  const task = "Count the words in three passages.";
+  await harness.waitFor("Paragraph:\n");
+  harness.child.stdin.write(`${task}\n\n`);
+  await harness.waitFor("Answer:\nThe counts are 4, 0, and 2.\n\nParagraph:\n");
+  expect(harness.transcript()).not.toContain("Counting the supplied text.");
+
+  const firstInput = [{ role: "user", content: task }];
+  const secondInput = [
+    ...firstInput,
+    ...firstResponse.output,
+    ...firstCalls,
+    { type: "function_call_output", call_id: "first", output: '{"count":4}' },
+    { type: "function_call_output", call_id: "empty", output: '{"count":0}' },
+  ];
+  expect(harness.requests[1]?.body.input).toEqual(secondInput);
+  expect(harness.requests[2]?.body.input).toEqual([
+    ...secondInput,
+    lastCall,
+    { type: "function_call_output", call_id: "last", output: '{"count":2}' },
+  ]);
+  for (const request of harness.requests) {
+    expect(request.body).toMatchObject({
+      store: false,
+      parallel_tool_calls: false,
+      tools: [
+        {
+          type: "function",
+          name: "count_words",
+          strict: true,
+          parameters: {
+            type: "object",
+            properties: { text: { type: "string" } },
+            required: ["text"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+    expect(request.body).not.toHaveProperty("previous_response_id");
+  }
+
+  harness.child.stdin.write("New paragraph.\n\n");
+  await harness.waitFor("Answer:\nA separate summary.\n\nParagraph:\n");
+  expect(harness.requests[3]?.body.input).toEqual([
+    { role: "user", content: "New paragraph." },
+  ]);
+  harness.child.stdin.write("/exit\n");
+  expect(await harness.finished).toEqual([0, null]);
+  expect(harness.requests).toHaveLength(4);
+});
+
+test.for([
+  { name: "unapproved_tool", args: "{}", error: "Unknown tool" },
+  { name: "count_words", args: "sensitive-invalid-json", error: "valid JSON" },
+  { name: "count_words", args: "null", error: "one string argument" },
+  { name: "count_words", args: "[]", error: "one string argument" },
+  { name: "count_words", args: '{"text":42}', error: "one string argument" },
+  {
+    name: "count_words",
+    args: '{"text":"hello","extra":true}',
+    error: "one string argument",
+  },
+])(
+  "CLI returns a safe tool error for $name with $args",
+  async (failure, context) => {
+    const harness = await startHarness(context, [
+      {
+        status: 200,
+        body: toolResponse([toolCall("invalid", failure.args, failure.name)]),
+      },
+      {
+        status: 200,
+        body: toolResponse([toolCall("corrected", '{"text":"one two three"}')]),
+      },
+      { status: 200, body: modelResponse("completed", "There are 3 words.") },
+    ]);
+    await harness.waitFor("Paragraph:\n");
+    harness.child.stdin.write("Count some words.\n\n");
+    await harness.waitFor("Answer:\nThere are 3 words.\n\nParagraph:\n");
+    const input = harness.requests[1]?.body.input as {
+      type?: string;
+      call_id?: string;
+      output?: string;
+    }[];
+    const result = input.find((item) => item.type === "function_call_output");
+    expect(result?.call_id).toBe("invalid");
+    expect(JSON.parse(result?.output ?? "").error).toContain(failure.error);
+    expect(result?.output).not.toContain("sensitive-invalid-json");
+    const lastInput = harness.requests[2]?.body.input as typeof input;
+    expect(lastInput.at(-1)).toEqual({
+      type: "function_call_output",
+      call_id: "corrected",
+      output: '{"count":3}',
+    });
+    harness.child.stdin.write("/exit\n");
+    expect(await harness.finished).toEqual([0, null]);
+  },
+);
+
+test.for([
+  {
+    limit: "Model-call",
+    batches: [["one"], ["two"], ["three"]],
+  },
+  {
+    limit: "Tool-call",
+    batches: [
+      ["one", "two"],
+      ["three", "four"],
+    ],
+  },
+])(
+  "CLI stops at the $limit limit and accepts the next submission",
+  async (scenario, context) => {
+    const harness = await startHarness(context, [
+      ...scenario.batches.map((batch) => ({
+        status: 200,
+        body: toolResponse(batch.map((id) => toolCall(id, '{"text":"a b"}'))),
+      })),
+      {
+        status: 200,
+        body: modelResponse("completed", "The next task succeeded."),
+      },
+    ]);
+    await harness.waitFor("Paragraph:\n");
+    harness.child.stdin.write("Keep counting.\n\n");
+    await harness.waitFor(`${scenario.limit} limit reached (3)`);
+    expect(harness.requests).toHaveLength(scenario.batches.length);
+    harness.child.stdin.write("A new task.\n\n");
+    await harness.waitFor("Answer:\nThe next task succeeded.\n\nParagraph:\n");
+    expect(harness.requests.at(-1)?.body.input).toEqual([
+      { role: "user", content: "A new task." },
+    ]);
+    harness.child.stdin.write("/exit\n");
+    expect(await harness.finished).toEqual([0, null]);
+    expect(harness.requests).toHaveLength(scenario.batches.length + 1);
+  },
+);
+
 test.for([
   {
     status: 429,
@@ -153,7 +338,7 @@ test.for([
   {
     status: 200,
     body: modelResponse("completed", "  "),
-    message: "no summary",
+    message: "no answer",
   },
 ])(
   "CLI recovers from $message without retrying or printing an unusable summary",
@@ -168,17 +353,17 @@ test.for([
     await harness.waitFor("Paragraph:\n");
     harness.child.stdin.write("First paragraph.\n\n");
     await harness.waitFor(failure.message);
-    expect(harness.transcript()).not.toContain("Summary:\n");
+    expect(harness.transcript()).not.toContain("Answer:\n");
     expect(harness.transcript()).not.toContain("sensitive-provider-detail");
     harness.child.stdin.write("Second paragraph.\n\n");
     await harness.waitFor(
-      "Summary:\nThe second submission succeeded.\n\nParagraph:\n",
+      "Answer:\nThe second submission succeeded.\n\nParagraph:\n",
     );
     harness.child.stdin.write("/exit\n");
     expect(await harness.finished).toEqual([0, null]);
     expect(harness.requests.map(({ body }) => body.input)).toEqual([
-      "First paragraph.",
-      "Second paragraph.",
+      [{ role: "user", content: "First paragraph." }],
+      [{ role: "user", content: "Second paragraph." }],
     ]);
   },
 );
